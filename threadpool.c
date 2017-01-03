@@ -28,10 +28,10 @@ struct thread_pool {
   // N worker threads.
   pthread_t *worker_threads;
 
-  // An array that holds tasks that are yet to be executed.
+  // A circular queue that holds tasks that are yet to be executed.
   struct task_data* task_queue;
 
-  // How many tasks do we have that are still not scheduled for execution.
+  // Head and tail of the queue.
   int queue_head, queue_tail;
 
   // How many worker threads can we have.
@@ -47,7 +47,7 @@ struct thread_pool {
   // to a state of work available.
   pthread_cond_t work_available;
 
-  // A condition that's signaled on when we are out of tasks to execute.
+  // A condition that's signaled on when we don't have any more tasks scheduled.
   pthread_cond_t done;
 };
 
@@ -130,6 +130,7 @@ void pool_wait(struct thread_pool *pool) {
   DEB("[POOL] Waiting done.");
 }
 
+
 struct thread_pool* pool_init(int max_threads) {
   struct thread_pool* pool = malloc(sizeof(struct thread_pool));
 
@@ -150,6 +151,7 @@ struct thread_pool* pool_init(int max_threads) {
 
   return pool;
 }
+
 
 void pool_destroy(struct thread_pool *pool) {
   pool_wait(pool);
