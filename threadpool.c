@@ -15,7 +15,7 @@
   #define DEBI(...)
 #endif
 
-const int TASK_BUFFER_MAX = 1000;
+const int TASK_QUEUE_MAX = 1000;
 
 
 struct task_data {
@@ -29,10 +29,10 @@ struct thread_pool {
   pthread_t *worker_threads;
 
   // An array that holds tasks that are yet to be executed.
-  struct task_data* task_buffer;
+  struct task_data* task_queue;
 
   // How many tasks do we have that are still not scheduled for execution.
-  int queued_count;
+  int queue_head, queue_tail;
 
   // How many worker threads can we have.
   int max_threads;
@@ -72,15 +72,15 @@ void *worker_thread_func(void *pool_arg) {
 
     Pthread_mutex_lock(&pool->mutex);
 
-    while (pool->queued_count == 0) {
+    while (pool->queue_head == pool->queue_tail) {
       DEB("[W] Empty queue. Waiting...");
       Pthread_cond_wait(&pool->work_available, &pool->mutex);
     }
 
-    assert(pool->queued_count > 0);
-    pool->queued_count--;
-    DEBI("[W] Picked", pool->queued_count);
-    picked_task = pool->task_buffer[pool->queued_count];
+    assert(pool->queue_head != pool->queue_tail);
+    DEBI("[W] Picked", pool->queue_head);
+    picked_task = pool->task_queue[pool->queue_head % TASK_QUEUE_MAX];
+    pool->queue_head++;
 
     // The task is scheduled.
     pool->scheduled++;
@@ -105,15 +105,16 @@ void *worker_thread_func(void *pool_arg) {
 void pool_add_task(struct thread_pool *pool, void *(*work_routine)(void*), void *arg) {
   Pthread_mutex_lock(&pool->mutex);
   DEB("[Q] Queueing one item.");
-  if (pool->queued_count == 0) {
+  if (pool->queue_head == pool->queue_tail) {
     Pthread_cond_broadcast(&pool->work_available);
   }
 
   struct task_data task;
   task.work_routine = work_routine;
   task.arg = arg;
-  assert(pool->queued_count < TASK_BUFFER_MAX);
-  pool->task_buffer[pool->queued_count++] = task;
+
+  pool->task_queue[pool->queue_tail % TASK_QUEUE_MAX] = task;
+  pool->queue_tail++;
 
   Pthread_mutex_unlock(&pool->mutex);
 }
@@ -122,7 +123,7 @@ void pool_add_task(struct thread_pool *pool, void *(*work_routine)(void*), void 
 void pool_wait(struct thread_pool *pool) {
   DEB("[POOL] Waiting for completion.");
   Pthread_mutex_lock(&pool->mutex);
-  while (pool->queued_count > 0) {
+  while (pool->scheduled > 0) {
     Pthread_cond_wait(&pool->done, &pool->mutex);
   }
   Pthread_mutex_unlock(&pool->mutex);
@@ -132,9 +133,9 @@ void pool_wait(struct thread_pool *pool) {
 struct thread_pool* pool_init(int max_threads) {
   struct thread_pool* pool = malloc(sizeof(struct thread_pool));
 
-  pool->queued_count = 0;
+  pool->queue_head = pool->queue_tail = 0;
   pool->scheduled = 0;
-  pool->task_buffer = malloc(sizeof(struct task_data) * TASK_BUFFER_MAX);
+  pool->task_queue = malloc(sizeof(struct task_data) * TASK_QUEUE_MAX);
 
   pool->max_threads = max_threads;
   pool->worker_threads = malloc(sizeof(pthread_t) * max_threads);
@@ -158,7 +159,7 @@ void pool_destroy(struct thread_pool *pool) {
   }
 
   free(pool->worker_threads);
-  free(pool->task_buffer);
+  free(pool->task_queue);
 
   free(pool);
 }
