@@ -66,5 +66,11 @@ Pthread_cond_signal(pthread_cond_t *cond) {
   assert(rc == 0);
 }
 
+void
+Pthread_cond_broadcast(pthread_cond_t *cond) {
+  int rc = pthread_cond_broadcast(cond);
+  assert(rc == 0);
+}
+
 
 #endif // __MYTHREADS_h__

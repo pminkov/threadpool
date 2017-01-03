@@ -8,45 +8,49 @@
 //#define DEBUG
 
 #ifdef DEBUG
-  #define DEB printf
+  #define DEB(x) printf("%s\n", x)
+  #define DEBI(msg, i) printf("%s: %d\n", msg, i)
 #else
   #define DEB(...)
+  #define DEBI(...)
 #endif
+
+const int TASK_BUFFER_MAX = 1000;
+
 
 struct task_data {
   void *(*work_routine)(void *);
   void *arg;
 };
 
+
 struct thread_pool {
-  // An array that holds the tasks.
+  // N worker threads.
+  pthread_t *worker_threads;
+
+  // An array that holds tasks that are yet to be executed.
   struct task_data* task_buffer;
 
-  // How many tasks do we have that are still not executing.
+  // How many tasks do we have that are still not scheduled for execution.
   int queued_count;
-
-  // How many tasks do we have that are executing. This doesn't become
-  // bigger than max threads.
-  int working_on;
 
   // How many worker threads can we have.
   int max_threads;
+
+  // How many tasks are scheduled for execution. We use this so that
+  // we can wait for completion.
+  int scheduled;
   
-  // The thread that looks for work and starts tasks.
-  pthread_t dispatcher_thread;
   pthread_mutex_t mutex;
 
   // A condition that's signaled on when we go from a state of no work
   // to a state of work available.
   pthread_cond_t work_available;
 
-  // A condition that's signaled on when we got from a state of a full
-  // work queue to having one slot available.
-  pthread_cond_t work_capacity_available;
+  // A condition that's signaled on when we are out of tasks to execute.
+  pthread_cond_t done;
 };
 
-
-const int TASK_BUFFER_MAX = 1000;
 
 int pool_get_max_threads(struct thread_pool *pool) {
   return pool->max_threads;
@@ -59,71 +63,50 @@ struct task_thread_args {
 };
 
 
-// This is the function that each worker thread executes.
-void* task_worker_thread(void *args_param) {
-  struct task_thread_args *args = (struct task_thread_args *) args_param;
-
-  args->td.work_routine(args->td.arg);
-
-  Pthread_mutex_lock(&args->pool->mutex);
-  args->pool->working_on--;
-  Pthread_cond_signal(&args->pool->work_capacity_available);
-  Pthread_mutex_unlock(&args->pool->mutex);
-
-  free(args_param);
-
-  return NULL;
-}
-
-void launch_work_task(struct thread_pool *pool, struct task_data td) {
-  pool->working_on++;
-
-  pthread_t thread;
-
-  struct task_thread_args *args = malloc(sizeof(struct task_thread_args));
-  args->pool = pool;
-  args->td = td;
-
-  Pthread_create(&thread, NULL, task_worker_thread, (void *)args);
-}
-
-void *dispatcher_thread_func(void *pool_arg) {
+void *worker_thread_func(void *pool_arg) {
+  DEB("[W] Starting work thread.");
   struct thread_pool *pool = (struct thread_pool *)pool_arg;
 
   while (1) {
+    struct task_data picked_task;
+
     Pthread_mutex_lock(&pool->mutex);
 
-    // Wait for the right conditions that allow scheduling a new task.
-    while (pool->queued_count == 0 || pool->working_on == pool->max_threads) {
-      if (pool->queued_count == 0) {
-        DEB("[W] Empty queue. Waiting...\n");
-        Pthread_cond_wait(&pool->work_available, &pool->mutex);
-      }
-
-      if (pool->working_on == pool->max_threads) {
-        DEB("[W] Full thread capacity. Waiting ...\n");
-        Pthread_cond_wait(&pool->work_capacity_available, &pool->mutex);
-      }
+    while (pool->queued_count == 0) {
+      DEB("[W] Empty queue. Waiting...");
+      Pthread_cond_wait(&pool->work_available, &pool->mutex);
     }
 
-    DEB("[W] Picking item from queue:\n");
-
     assert(pool->queued_count > 0);
-    assert(pool->working_on < pool->max_threads);
-    
     pool->queued_count--;
-    launch_work_task(pool, pool->task_buffer[pool->queued_count]);
+    DEBI("[W] Picked", pool->queued_count);
+    picked_task = pool->task_buffer[pool->queued_count];
 
+    // The task is scheduled.
+    pool->scheduled++;
+
+    Pthread_mutex_unlock(&pool->mutex);
+
+    // Run the task.
+    picked_task.work_routine(picked_task.arg);
+
+    Pthread_mutex_lock(&pool->mutex);
+    pool->scheduled--;
+
+    if (pool->scheduled == 0) {
+      Pthread_cond_signal(&pool->done);
+    }
     Pthread_mutex_unlock(&pool->mutex);
   }
   return NULL;
 }
 
+
 void pool_add_task(struct thread_pool *pool, void *(*work_routine)(void*), void *arg) {
   Pthread_mutex_lock(&pool->mutex);
-  DEB("[Q] Queueing one item.\n");
+  DEB("[Q] Queueing one item.");
   if (pool->queued_count == 0) {
-    Pthread_cond_signal(&pool->work_available);
+    Pthread_cond_broadcast(&pool->work_available);
   }
 
   struct task_data task;
@@ -135,36 +118,47 @@ void pool_add_task(struct thread_pool *pool, void *(*work_routine)(void*), void 
   Pthread_mutex_unlock(&pool->mutex);
 }
 
+
 void pool_wait(struct thread_pool *pool) {
+  DEB("[POOL] Waiting for completion.");
   Pthread_mutex_lock(&pool->mutex);
-
-  while (pool->queued_count > 0 || pool->working_on > 0) {
-    Pthread_cond_wait(&pool->work_capacity_available, &pool->mutex);
+  while (pool->queued_count > 0) {
+    Pthread_cond_wait(&pool->done, &pool->mutex);
   }
-
   Pthread_mutex_unlock(&pool->mutex);
+  DEB("[POOL] Waiting done.");
 }
 
 struct thread_pool* pool_init(int max_threads) {
   struct thread_pool* pool = malloc(sizeof(struct thread_pool));
 
   pool->queued_count = 0;
-  pool->working_on = 0;
+  pool->scheduled = 0;
   pool->task_buffer = malloc(sizeof(struct task_data) * TASK_BUFFER_MAX);
+
   pool->max_threads = max_threads;
+  pool->worker_threads = malloc(sizeof(pthread_t) * max_threads);
 
   Pthread_mutex_init(&pool->mutex);
   Pthread_cond_init(&pool->work_available);
-  Pthread_cond_init(&pool->work_capacity_available);
+  Pthread_cond_init(&pool->done);
 
-  Pthread_create(&pool->dispatcher_thread, NULL, dispatcher_thread_func, pool);
+  for (int i = 0; i < max_threads; i++) {
+    Pthread_create(&pool->worker_threads[i], NULL, worker_thread_func, pool);
+  }
 
   return pool;
 }
 
 void pool_destroy(struct thread_pool *pool) {
   pool_wait(pool);
-  Pthread_detach(pool->dispatcher_thread);
+
+  for (int i = 0; i < pool->max_threads; i++) {
+    Pthread_detach(pool->worker_threads[i]);
+  }
+
+  free(pool->worker_threads);
   free(pool->task_buffer);
+
   free(pool);
 }
